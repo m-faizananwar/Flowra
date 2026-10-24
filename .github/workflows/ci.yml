@@ -84,6 +84,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: [docker]
     if: github.ref == 'refs/heads/production'
+    # One deploy at a time: back-to-back pushes queue instead of racing on the VPS.
+    concurrency:
+      group: deploy-vps
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - name: Deploy via SSH
@@ -92,10 +96,19 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          # set -e: any failing step fails the deploy instead of rebuilding stale code.
+          # fetch + reset (not pull): the VPS mirrors origin/production even after a
+          # history rewrite; untracked files such as apps/engine/.env are untouched.
+          # No separate `down`: a failed build leaves the running engine alone, and
+          # `up -d` swaps the container in one step.
           script: |
+            set -e
             cd /home/ubuntu/flowra
-            git pull origin production
+            git fetch origin production
+            git reset --hard origin/production
+            git merge-base --is-ancestor "${{ github.sha }}" HEAD || { echo "VPS at $(git rev-parse --short HEAD) does not contain ${{ github.sha }}"; exit 1; }
             sudo docker compose -f apps/engine/docker-compose.yml build
-            sudo docker compose -f apps/engine/docker-compose.yml down
             sudo docker compose -f apps/engine/docker-compose.yml up -d
+            curl -fsS --retry 12 --retry-delay 5 --retry-all-errors http://127.0.0.1:3005/health > /dev/null
+            echo "Deployed $(git rev-parse --short HEAD) and engine is healthy"
             sudo docker image prune -f
